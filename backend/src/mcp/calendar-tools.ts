@@ -1,141 +1,94 @@
-import { AuthenticatedExtra, defineTool } from "@descope/mcp-express";
+import { defineTool, type AuthenticatedExtra } from "@descope/mcp-express";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { ElicitResultSchema, type ElicitResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { listUpcomingMeetings, createMeeting } from "../services/calendar.service.js";
+import { createMeeting, listUpcomingMeetings } from "../services/calendar.service.js";
 
-function textResult(data: unknown, isError = false) {
-  return {
-    content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
-    isError,
-  };
+const eventSchema = z.object({
+  id: z.string().nullable().optional(), title: z.string(), description: z.string().nullable(), location: z.string().nullable(),
+  start: z.string().nullable(), end: z.string().nullable(), htmlLink: z.string().nullable(), meetLink: z.string().nullable(), attendees: z.array(z.string()),
+});
+const meetingOutput = { ok: z.boolean(), meetings: z.array(eventSchema).optional(), meeting: eventSchema.extend({ inviteEmailsSent: z.boolean(), googleMeetAdded: z.boolean() }).optional(), error: z.object({ code: z.string(), message: z.string() }).optional() };
+const outputShape = meetingOutput;
+
+function subject(extra: AuthenticatedExtra) {
+  try {
+    const token = extra.authInfo?.token;
+    const payload = token ? JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8")) as { sub?: unknown } : {};
+    if (typeof payload.sub !== "string" || !payload.sub) throw new Error();
+    return payload.sub;
+  } catch { throw Object.assign(new Error("Authentication required"), { kind: "authentication" }); }
 }
 
-function authUserIdFromToken(token: string): string {
-  const payload = JSON.parse(
-    Buffer.from(token.split(".")[1] ?? "", "base64").toString("utf8"),
-  ) as { sub?: string };
-
-  if (!payload.sub) {
-    throw new Error("MCP token has no user id");
-  }
-
-  return String(payload.sub);
+function failure(error: unknown) {
+  const e = error as { kind?: string; code?: number; response?: { status?: number } };
+  const status = e.response?.status ?? e.code;
+  if (e.kind === "authentication") return { code: "AUTHENTICATION", message: "Authentication is required." };
+  if (e.kind === "validation") return { code: "VALIDATION", message: "The idempotency key was already used with different meeting details." };
+  if (status === 401) return { code: "AUTHENTICATION", message: "Calendar authorization is unavailable. Reconnect Google Calendar." };
+  if (status === 403) return { code: "AUTHORIZATION", message: "You are not authorized to access this calendar operation." };
+  if (status === 400 || status === 422) return { code: "VALIDATION", message: "The meeting details are invalid." };
+  if (typeof status === "number" && status >= 500) return { code: "EXTERNAL_API", message: "Google Calendar is temporarily unavailable." };
+  return { code: "INTERNAL", message: "The calendar operation could not be completed." };
 }
 
-const defineMcpTool = defineTool as (cfg: {
-  name: string;
-  description: string;
-  input?: Record<string, unknown>;
-  scopes?: string[];
-  handler: (
-    args: Record<string, unknown>,
-    extra: AuthenticatedExtra,
-  ) => ReturnType<typeof textResult> | Promise<ReturnType<typeof textResult>>;
-}) => ReturnType<typeof defineTool>;
+function result(data: Record<string, unknown>, error = false) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], structuredContent: data, isError: error };
+}
+
+const defineMcpTool = defineTool as unknown as (cfg: {
+  name: string; description: string; input?: z.ZodObject<any>; output?: Record<string, z.ZodType>;
+  scopes?: string[]; handler: (args: any, extra: AuthenticatedExtra) => any;
+}) => (server: McpServer) => unknown;
 
 export const listUpcomingMeetingsTools = defineMcpTool({
-  name: "listUpcomingMeetings",
-  description:
-    "List Google Calendar events. Set todayOnly=true for today's agenda only.",
-  input: {
-    maxResults: z.number().int().min(1).max(20).optional(),
-
-    todayOnly: z
-      .boolean()
-      .optional()
-      .default(true)
-      .describe("If true, only return events for today"),
-  },
-  scopes: ["profile"],
+  name: "listUpcomingMeetings", description: "List upcoming meetings from the authenticated user's Google Calendar.",
+  input: z.object({ maxResults: z.number().int().min(1).max(20).optional(), todayOnly: z.boolean().optional().default(false) }),
+  output: { ok: z.boolean(), meetings: z.array(eventSchema), error: z.object({ code: z.string(), message: z.string() }).optional() }, scopes: ["profile"], //calendar:read
   handler: async (args, extra) => {
     try {
-      const authUserId = authUserIdFromToken(extra.authInfo.token);
-
-      const meetings = await listUpcomingMeetings({
-        authUserId,
-        maxResults:
-          typeof args.maxResults === "number" ? args.maxResults : undefined,
-        todayOnly:
-          typeof args.todayOnly === "boolean" ? args.todayOnly : undefined,
-      });
-
-      return textResult({ meetings });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "List Failed";
-      return textResult({ error: message }, true);
-    }
+      const meetings = await listUpcomingMeetings({ authUserId: subject(extra), maxResults: args.maxResults, todayOnly: args.todayOnly });
+      return result({ ok: true, meetings });
+    } catch (error) { return result({ ok: false, meetings: [], error: failure(error) }, true); }
   },
 });
 
-
-
-const createMeetingShape = {
-  title: z.string().trim().min(1).max(200)
-    .describe("Title of the meeting"),
-
-  startIso: z.string().datetime({ offset: true })
-    .describe("Meeting start time in ISO 8601 format, including timezone offset"),
-
-  endIso: z.string().datetime({ offset: true })
-    .describe("Meeting end time in ISO 8601 format, including timezone offset"),
-
-  attendeeEmails: z.array(z.string().email()).max(100).optional()
-    .describe("Email addresses of meeting attendees"),
-
-  description: z.string().max(5000).optional()
-    .describe("Optional meeting description"),
-
-  addGoogleMeet: z.boolean().optional()
-    .describe("Whether to generate a Google Meet link. Defaults to true"),
-};
-
-const createMeetingSchema = z.object(createMeetingShape)
-  .refine(
-    (data) => new Date(data.endIso) > new Date(data.startIso),
-    {
-      message: "Meeting end time must be after start time",
-      path: ["endIso"],
-    }
-  );
+const createInput = z.object({
+  title: z.string().trim().min(1).max(200).optional(),
+  startIso: z.string().datetime({ offset: true }).optional(), endIso: z.string().datetime({ offset: true }).optional(),
+  attendeeEmails: z.array(z.string().email()).max(100).optional(), description: z.string().max(5000).optional(), addGoogleMeet: z.boolean().optional(),
+  idempotencyKey: z.string().min(8).max(200).optional(),
+});
 
 export const createMeetingTool = defineMcpTool({
-  name: "createMeeting",
-  description: `
-    Create a Google Calendar meeting.
-
-    You can optionally invite attendees by providing their email addresses.
-    A Google Meet conferencing link is generated by default.
-
-    Supply start and end times as ISO 8601 timestamps with timezone offsets.
-    Do not create a meeting unless the user has explicitly requested it.
-  `,
-  input: createMeetingShape,
-  scopes: ["profile"], //["calendar:write"],
-
+  name: "createMeeting", description: "Create a Google Calendar meeting. Ask for missing title or start and end times; never invent them. Attendee invitations are sent when emails are provided.",
+  input: createInput, output: outputShape, scopes: ["profile"], //calendar:write
   handler: async (args, extra) => {
     try {
-      const parsed = createMeetingSchema.safeParse(args);
-
-      if (!parsed.success) {
-        return textResult({
-          error: "Invalid meeting details",
-          details: parsed.error.issues,
-        }, true
-      );
+      const authUserId = subject(extra);
+      let data = args;
+      if (!args.title || !args.startIso || !args.endIso) {
+        let elicited: ElicitResult;
+        try {
+          elicited = await extra.sendRequest({ method: "elicitation/create", params: {
+            mode: "form", message: "Please provide the meeting title and start and end times, including timezone offsets.",
+            requestedSchema: { type: "object", properties: {
+              title: { type: "string", title: "Meeting title", minLength: 1, maxLength: 200 },
+              startIso: { type: "string", title: "Start time (ISO 8601 with offset)", format: "date-time" },
+              endIso: { type: "string", title: "End time (ISO 8601 with offset)", format: "date-time" },
+            }, required: ["title", "startIso", "endIso"] },
+          } }, ElicitResultSchema);
+        } catch {
+          return result({ ok: false, error: { code: "MISSING_INFORMATION", message: "Please provide the meeting title, start time, and end time (with timezone offsets) before creating the event." } }, true);
+        }
+        if (elicited.action !== "accept") return result({ ok: false, error: { code: elicited.action === "decline" ? "DECLINED" : "CANCELLED", message: "Meeting creation was cancelled; no event was created." } });
+        const filled = z.object({ title: z.string().trim().min(1).max(200), startIso: z.string().datetime({ offset: true }), endIso: z.string().datetime({ offset: true }) }).safeParse(elicited.content);
+        if (!filled.success || new Date(filled.data.endIso) <= new Date(filled.data.startIso)) return result({ ok: false, error: { code: "VALIDATION", message: "The supplied meeting details are invalid. Please provide a title and a valid start and end time." } }, true);
+        data = { ...args, ...filled.data };
       }
-
-      const authUserId = authUserIdFromToken(extra.authInfo.token);
-
-      const meeting = await createMeeting({
-        authUserId,
-        ...parsed.data,
-      });
-
-      return textResult({ meeting });
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Meeting creation failed";
-
-      return textResult({ error: message }, true);
-    }
+      if (new Date(data.endIso!) <= new Date(data.startIso!)) return result({ ok: false, error: { code: "VALIDATION", message: "Meeting end time must be after start time." } }, true);
+      const meeting = await createMeeting({ authUserId, ...data });
+      return result({ ok: true, meeting });
+    } catch (error) { return result({ ok: false, error: failure(error) }, true); }
   },
 });

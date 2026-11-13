@@ -1,5 +1,7 @@
 import { descopeMcpAuthRouter, DescopeMcpProvider } from "@descope/mcp-express";
 import { createMeetingTool, listUpcomingMeetingsTools } from "./calendar-tools.js";
+import { registerCalendarResources } from "./calendar-resources.js";
+import { registerMeetingPrompts } from "./prompts.js";
 import type { Express } from "express";
 
 export function mountMcpServer(app: Express) {
@@ -20,9 +22,11 @@ export function mountMcpServer(app: Express) {
 
   app.use(
     descopeMcpAuthRouter((server) => {
-      // register all out tools
+      // The Descope adapter creates a fresh authenticated MCP server per request.
       listUpcomingMeetingsTools(server);
       createMeetingTool(server);
+      registerCalendarResources(server);
+      registerMeetingPrompts(server);
     }, provider),
   );
 

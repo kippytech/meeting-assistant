@@ -1,5 +1,7 @@
 import { google } from "googleapis";
 import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
+import { getPool } from "../db/pool.js";
 import { getCalendarAccessToken } from "./token.service.js";
 
 function calendarClient(accessToken: string) {
@@ -86,6 +88,12 @@ export async function listUpcomingMeetings(input: {
   return (response.data.items ?? []).map(formatEvent);
 }
 
+export async function getMeeting(input: { authUserId: string; eventId: string }) {
+  const calendar = await calendarForUser(input.authUserId);
+  const response = await calendar.events.get({ calendarId: "primary", eventId: input.eventId });
+  return formatEvent(response.data);
+}
+
 export async function createMeeting(input: {
   authUserId: string;
   title: string;
@@ -94,17 +102,50 @@ export async function createMeeting(input: {
   attendeeEmails?: string[];
   description?: string;
   addGoogleMeet?: boolean;
+  idempotencyKey?: string;
 }) {
+  // Stable per-user logical-operation key, persisted before contacting Google.
+  // Google event IDs are also deterministic, allowing recovery after an uncertain insert.
+  const pool = getPool();
+  const normalized = {
+    title: input.title.trim(), startIso: input.startIso, endIso: input.endIso,
+    attendeeEmails: [...(input.attendeeEmails ?? [])].map((e) => e.toLowerCase()).sort(),
+    description: input.description ?? "", addGoogleMeet: input.addGoogleMeet !== false,
+  };
+  const fingerprint = input.idempotencyKey
+    ? createHash("sha256").update(`client:${input.idempotencyKey}`).digest("hex")
+    : createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+  const eventId = `m${fingerprint.slice(0, 39)}`;
+  const payloadHash = createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+  const reservation = await pool.query(
+    `INSERT INTO meeting_idempotency (auth_user_id, operation_key, payload_hash, google_event_id, status)
+     VALUES ($1, $2, $3, $4, 'pending') ON CONFLICT (auth_user_id, operation_key) DO NOTHING RETURNING google_event_id`,
+    [input.authUserId, fingerprint, payloadHash, eventId],
+  );
+  const isNew = reservation.rowCount === 1;
+  const existing = isNew ? null : (await pool.query<{ google_event_id: string; status: string; payload_hash: string }>(
+    `SELECT google_event_id, status, payload_hash FROM meeting_idempotency WHERE auth_user_id = $1 AND operation_key = $2`,
+    [input.authUserId, fingerprint],
+  )).rows[0];
+  if (existing && existing.payload_hash !== payloadHash) throw Object.assign(new Error("Idempotency key reused with different meeting details"), { kind: "validation" });
+  if (!isNew && existing?.status === "complete") {
+    const calendar = await calendarForUser(input.authUserId);
+    const response = await calendar.events.get({ calendarId: "primary", eventId: existing.google_event_id });
+    return { ...formatEvent(response.data), inviteEmailsSent: normalized.attendeeEmails.length > 0, googleMeetAdded: normalized.addGoogleMeet };
+  }
   const calendar = await calendarForUser(input.authUserId);
 
   // enabling this one by default
   const withMeet = input.addGoogleMeet !== false;
 
-  const response = await calendar.events.insert({
+  let response;
+  try {
+    response = await calendar.events.insert({
     calendarId: "primary",
     sendUpdates: "all",
     conferenceDataVersion: withMeet ? 1 : undefined,
     requestBody: {
+      id: isNew ? eventId : existing?.google_event_id ?? eventId,
       summary: input.title,
       description: input.description,
       start: {
@@ -125,7 +166,18 @@ export async function createMeeting(input: {
           }
         : undefined,
     },
-  });
+    });
+  } catch (error) {
+    // A duplicate deterministic Google event ID means a prior attempt may have
+    // reached Google before its response was lost. Read it back and finalize.
+    if ((error as { code?: number }).code !== 409) throw error;
+    response = await calendar.events.get({ calendarId: "primary", eventId: existing?.google_event_id ?? eventId });
+  }
+
+  await pool.query(
+    `UPDATE meeting_idempotency SET status = 'complete', updated_at = NOW() WHERE auth_user_id = $1 AND operation_key = $2`,
+    [input.authUserId, fingerprint],
+  );
 
   return {
     ...formatEvent(response.data),
