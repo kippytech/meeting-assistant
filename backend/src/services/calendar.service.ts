@@ -104,6 +104,9 @@ export async function createMeeting(input: {
   addGoogleMeet?: boolean;
   idempotencyKey?: string;
 }) {
+  const maxAttempts = 5;
+  const leaseMilliseconds = 90_000;
+  const leaseRenewalMilliseconds = 25_000;
   // Stable per-user logical-operation key, persisted before contacting Google.
   // Google event IDs are also deterministic, allowing recovery after an uncertain insert.
   const pool = getPool();
@@ -117,73 +120,109 @@ export async function createMeeting(input: {
     : createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
   const eventId = `m${fingerprint.slice(0, 39)}`;
   const payloadHash = createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+  const claimToken = randomUUID();
   const reservation = await pool.query(
-    `INSERT INTO meeting_idempotency (auth_user_id, operation_key, payload_hash, google_event_id, status)
-     VALUES ($1, $2, $3, $4, 'pending') ON CONFLICT (auth_user_id, operation_key) DO NOTHING RETURNING google_event_id`,
-    [input.authUserId, fingerprint, payloadHash, eventId],
+    `INSERT INTO meeting_idempotency
+       (auth_user_id, operation_key, payload_hash, google_event_id, status, claim_token, lease_until, retry_count)
+     VALUES ($1, $2, $3, $4, 'processing', $5, NOW() + ($6 * INTERVAL '1 millisecond'), 1)
+     ON CONFLICT (auth_user_id, operation_key) DO UPDATE
+       SET status = 'processing', claim_token = EXCLUDED.claim_token,
+           lease_until = EXCLUDED.lease_until, retry_count = meeting_idempotency.retry_count + 1,
+           updated_at = NOW()
+       WHERE meeting_idempotency.payload_hash = EXCLUDED.payload_hash
+         AND meeting_idempotency.retry_count < $7
+         AND ((meeting_idempotency.status = 'pending' AND
+               (meeting_idempotency.next_retry_at IS NULL OR meeting_idempotency.next_retry_at <= NOW()))
+           OR (meeting_idempotency.status = 'processing' AND meeting_idempotency.lease_until <= NOW()))
+     RETURNING google_event_id`,
+    [input.authUserId, fingerprint, payloadHash, eventId, claimToken, leaseMilliseconds, maxAttempts],
   );
-  const isNew = reservation.rowCount === 1;
-  const existing = isNew ? null : (await pool.query<{ google_event_id: string; status: string; payload_hash: string }>(
-    `SELECT google_event_id, status, payload_hash FROM meeting_idempotency WHERE auth_user_id = $1 AND operation_key = $2`,
+  const claimed = reservation.rowCount === 1;
+  const existing = claimed ? null : (await pool.query<{ google_event_id: string; status: string; payload_hash: string; next_retry_at: Date | null }>(
+    `SELECT google_event_id, status, payload_hash, next_retry_at FROM meeting_idempotency WHERE auth_user_id = $1 AND operation_key = $2`,
     [input.authUserId, fingerprint],
   )).rows[0];
   if (existing && existing.payload_hash !== payloadHash) throw Object.assign(new Error("Idempotency key reused with different meeting details"), { kind: "validation" });
-  if (!isNew && existing?.status === "complete") {
+  if (existing?.status === "complete") {
     const calendar = await calendarForUser(input.authUserId);
     const response = await calendar.events.get({ calendarId: "primary", eventId: existing.google_event_id });
     return { ...formatEvent(response.data), inviteEmailsSent: normalized.attendeeEmails.length > 0, googleMeetAdded: normalized.addGoogleMeet };
   }
-  const calendar = await calendarForUser(input.authUserId);
-
-  // enabling this one by default
-  const withMeet = input.addGoogleMeet !== false;
-
-  let response;
-  try {
-    response = await calendar.events.insert({
-    calendarId: "primary",
-    sendUpdates: "all",
-    conferenceDataVersion: withMeet ? 1 : undefined,
-    requestBody: {
-      id: isNew ? eventId : existing?.google_event_id ?? eventId,
-      summary: input.title,
-      description: input.description,
-      start: {
-        dateTime: input.startIso,
-      },
-      end: {
-        dateTime: input.endIso,
-      },
-      attendees: (input.attendeeEmails ?? []).map((email) => ({ email })),
-      conferenceData: withMeet
-        ? {
-            createRequest: {
-              requestId: randomUUID(),
-              conferenceSolutionKey: {
-                type: "hangoutsMeet",
-              },
-            },
-          }
-        : undefined,
-    },
-    });
-  } catch (error) {
-    // A duplicate deterministic Google event ID means a prior attempt may have
-    // reached Google before its response was lost. Read it back and finalize.
-    if ((error as { code?: number }).code !== 409) throw error;
-    response = await calendar.events.get({ calendarId: "primary", eventId: existing?.google_event_id ?? eventId });
+  if (!claimed) {
+    if (existing?.status === "failed") {
+      throw Object.assign(new Error("Meeting creation failed after the maximum number of attempts"), { kind: "failed" });
+    }
+    if (existing?.status === "pending" && existing.next_retry_at && existing.next_retry_at > new Date()) {
+      throw Object.assign(new Error("Meeting creation is waiting for its scheduled retry"), { kind: "retry_scheduled", nextRetryAt: existing.next_retry_at });
+    }
+    throw Object.assign(new Error("Meeting creation is already in progress; retry shortly"), { kind: "in_progress" });
   }
 
-  await pool.query(
-    `UPDATE meeting_idempotency SET status = 'complete', updated_at = NOW() WHERE auth_user_id = $1 AND operation_key = $2`,
-    [input.authUserId, fingerprint],
-  );
+  let leaseLost = false;
+  let renewalInFlight = false;
+  const heartbeat = setInterval(() => {
+    if (renewalInFlight) return;
+    renewalInFlight = true;
+    void pool.query(
+      `UPDATE meeting_idempotency SET lease_until = NOW() + ($4 * INTERVAL '1 millisecond'), updated_at = NOW()
+       WHERE auth_user_id = $1 AND operation_key = $2 AND status = 'processing' AND claim_token = $3 AND lease_until > NOW()`,
+      [input.authUserId, fingerprint, claimToken, leaseMilliseconds],
+    ).then((renewal) => { if (renewal.rowCount !== 1) leaseLost = true; })
+      .catch(() => { /* A later heartbeat can renew after a transient database error. */ })
+      .finally(() => { renewalInFlight = false; });
+  }, leaseRenewalMilliseconds);
+  heartbeat.unref?.();
 
-  return {
-    ...formatEvent(response.data),
-    inviteEmailsSent: (input.attendeeEmails ?? []).length > 0,
-    googleMeetAdded: withMeet,
-  };
+  try {
+    const calendar = await calendarForUser(input.authUserId);
+    const withMeet = input.addGoogleMeet !== false;
+    let response;
+    try {
+      response = await calendar.events.insert({
+        calendarId: "primary",
+        sendUpdates: "all",
+        conferenceDataVersion: withMeet ? 1 : undefined,
+        requestBody: {
+          id: eventId,
+          summary: input.title,
+          description: input.description,
+          start: { dateTime: input.startIso },
+          end: { dateTime: input.endIso },
+          attendees: (input.attendeeEmails ?? []).map((email) => ({ email })),
+          conferenceData: withMeet ? {
+            createRequest: { requestId: randomUUID(), conferenceSolutionKey: { type: "hangoutsMeet" } },
+          } : undefined,
+        },
+      });
+    } catch (error) {
+      // The deterministic event ID also recovers if Google succeeded but its response was lost.
+      if ((error as { code?: number }).code !== 409) throw error;
+      response = await calendar.events.get({ calendarId: "primary", eventId });
+    }
+
+    if (leaseLost) throw Object.assign(new Error("Meeting creation lease expired"), { kind: "in_progress" });
+    const completed = await pool.query(
+      `UPDATE meeting_idempotency SET status = 'complete', claim_token = NULL, lease_until = NULL, updated_at = NOW()
+       WHERE auth_user_id = $1 AND operation_key = $2 AND status = 'processing' AND claim_token = $3 AND lease_until > NOW()`,
+      [input.authUserId, fingerprint, claimToken],
+    );
+    if (completed.rowCount !== 1) throw Object.assign(new Error("Meeting creation lease was claimed by another request"), { kind: "in_progress" });
+    return { ...formatEvent(response.data), inviteEmailsSent: (input.attendeeEmails ?? []).length > 0, googleMeetAdded: withMeet };
+  } catch (error) {
+    // Release only our own claim. A crash instead leaves a lease that expires naturally.
+    await pool.query(
+      `UPDATE meeting_idempotency
+       SET status = CASE WHEN retry_count >= $4 THEN 'failed' ELSE 'pending' END,
+           next_retry_at = CASE WHEN retry_count >= $4 THEN NULL ELSE
+             NOW() + (LEAST(3600, 30 * POWER(2, GREATEST(0, retry_count - 1))) * INTERVAL '1 second') END,
+           claim_token = NULL, lease_until = NULL, updated_at = NOW()
+       WHERE auth_user_id = $1 AND operation_key = $2 AND status = 'processing' AND claim_token = $3`,
+      [input.authUserId, fingerprint, claimToken, maxAttempts],
+    );
+    throw error;
+  } finally {
+    clearInterval(heartbeat);
+  }
 }
 
 export async function cancelMeeting(input: {

@@ -8,12 +8,29 @@ import { mountMcpServer } from "./mcp/mount.js";
 
 const app = express();
 const port = Number(process.env.PORT) || 4000;
-const appOrigin = process.env.APP_URL ?? "http://localhost:3000";
+//const appOrigin = process.env.APP_URL ?? "http://localhost:3000";
+const allowedOrigins = [
+  "http://localhost:3000",
+  "http://localhost:6274",
+];
 
 app.use(
   cors({
-    origin: appOrigin,
+    origin: allowedOrigins,
     credentials: true,
+    exposedHeaders: [
+      "WWW-Authenticate",
+      "Mcp-Session-Id",
+      "Mcp-Protocol-Version",
+    ],
+    allowedHeaders: [
+      "Authorization",
+      "Content-Type",
+      "Accept",
+      "MCP-Protocol-Version",
+      "Mcp-Session-Id",
+      "Last-Event-ID",
+    ],
   }),
 );
 

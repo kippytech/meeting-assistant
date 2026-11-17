@@ -25,6 +25,7 @@ function failure(error: unknown) {
   const status = e.response?.status ?? e.code;
   if (e.kind === "authentication") return { code: "AUTHENTICATION", message: "Authentication is required." };
   if (e.kind === "validation") return { code: "VALIDATION", message: "The idempotency key was already used with different meeting details." };
+  if (e.kind === "in_progress") return { code: "IN_PROGRESS", message: "This meeting request is already being processed. Retry shortly." };
   if (status === 401) return { code: "AUTHENTICATION", message: "Calendar authorization is unavailable. Reconnect Google Calendar." };
   if (status === 403) return { code: "AUTHORIZATION", message: "You are not authorized to access this calendar operation." };
   if (status === 400 || status === 422) return { code: "VALIDATION", message: "The meeting details are invalid." };
