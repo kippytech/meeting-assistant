@@ -31,8 +31,9 @@ export type ThreadMessage = {
 };
 
 function modelName() {
-  //return `openai/${process.env.AI_MODEL ?? "gpt-4o-mini"}`;
-  return "google/gemini-3.8-flash"
+  // Mastra model identifiers use the provider/model form, for example
+  // "google/gemini-3.8-flash" or "openai/gpt-4o-mini".
+  return process.env.AI_MODEL ?? "google/gemini-3.8-flash";
 }
 
 function messageText(content: unknown): string {
@@ -131,13 +132,6 @@ export async function getThreadMessages(
 }
 
 export async function streamAgentReply(input: StreamAgentReplyInput) {
-  // if (!process.env.OPENAI_API_KEY) {
-  //   throw new Error("OPENAI_API_KEY is not set in env");
-  // }
-  if (!process.env.GOOGLE_API_KEY) {
-    throw new Error("GOOGLE_API_KEY is not set in env");
-  }
-
   input.onEvent({
     type: "started",
     message: "Agent is planning",
