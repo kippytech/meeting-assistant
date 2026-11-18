@@ -167,6 +167,20 @@ export async function streamAgentReply(input: StreamAgentReplyInput) {
 
     switch (chunk.type) {
       case "tool-call":
+        // if (chunk.payload.toolName === "updateWorkingMemory" || chunk.payload.toolName === "setWorkingMemory") {
+        //   await input.onEvent({
+        //     type: "progress",
+        //     message: `Updating working memory`,
+        //   });
+        // }
+
+        // if (chunk.payload.toolName === "getConversationHistory") {
+        //   await input.onEvent({
+        //     type: "progress",
+        //     message: `Retrieving conversation history`,
+        //   });
+        // }
+
         await input.onEvent({
           type: "progress",
           message: `Running ${chunk.payload.toolName}`,

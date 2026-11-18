@@ -7,6 +7,7 @@ import {
   listUpcomingMeetings,
   rescheduleMeeting,
 } from "./calendar.service.js";
+import { createAgentMemory } from "../config/memory.js";
 
 export function createCalendarTools(authUserId: string) {
   return {
@@ -99,6 +100,26 @@ export function createCalendarTools(authUserId: string) {
           authUserId,
           ...input,
         });
+      },
+    }),
+
+    getConversationHistory: createTool({
+      id: "getConversationHistory",
+      description: "Retrieve older messages from the user's conversation history.",
+      inputSchema: z.object({
+        threadId: z.string(),
+        page: z.number().int().min(0).optional().describe("Page number for pagination"),
+      }),
+      execute: async ({ threadId, page }) => {
+        const memory = createAgentMemory();
+        const result = await memory.recall({
+          threadId,
+          resourceId: authUserId,
+          page,
+          perPage: 30,
+        });
+
+        return result.messages;
       },
     }),
   };
