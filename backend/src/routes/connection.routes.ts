@@ -26,7 +26,7 @@ connectionRouter.post("/connect", async (req, res) => {
       typeof req.body?.refreshToken === "string" ? req.body.refreshToken : "";
 
     if (!refreshToken) {
-      res.status(400).json({ error: "Refresh token required" });
+      return res.status(400).json({ error: "Refresh token required" });
     }
 
     const redirectUrl =

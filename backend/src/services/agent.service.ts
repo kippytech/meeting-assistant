@@ -14,7 +14,8 @@ export type StreamAgentReplyInput = {
   authUserId: string;
   threadId: string;
   message: string;
-  onEvent: (event: AgentEvent) => void;
+  onEvent: (event: AgentEvent) => Promise<void>;
+  signal?: AbortSignal;
 };
 
 export type ThreadSummary = {
@@ -95,7 +96,7 @@ export async function getThreadMessages(
   const recalledMemoryData = await memory.recall({
     threadId,
     resourceId: authUserId,
-    perPage: false,
+    perPage: false, //prefer cursor-based pagination over this
   });
 
   const messages: ThreadMessage[] = [];
@@ -112,6 +113,13 @@ export async function getThreadMessages(
         ? message.role
         : "system";
 
+    // if (
+    //   message.role !== "user" &&
+    //   message.role !== "assistant"
+    // ) {
+    //   continue;
+    // }
+
     messages.push({
       id: message.id,
       role,
@@ -123,8 +131,11 @@ export async function getThreadMessages(
 }
 
 export async function streamAgentReply(input: StreamAgentReplyInput) {
-  if (!process.env.GOOGLE_GEMINI_API_KEY) {
-    throw new Error("GOOGLE_GEMINI_API_KEY is not set in env");
+  // if (!process.env.OPENAI_API_KEY) {
+  //   throw new Error("OPENAI_API_KEY is not set in env");
+  // }
+  if (!process.env.GOOGLE_API_KEY) {
+    throw new Error("GOOGLE_API_KEY is not set in env");
   }
 
   input.onEvent({
@@ -143,37 +154,93 @@ export async function streamAgentReply(input: StreamAgentReplyInput) {
     memory,
   });
 
+  console.log("[agent] agent constructed");
+
   const result = await agent.stream(input.message, {
     memory: {
       resource: input.authUserId,
       thread: input.threadId,
     },
+    abortSignal: input.signal,
   });
 
+  let streamError: unknown;
+
+  console.log("[agent] stream initialized");
+
   for await (const chunk of result.fullStream) {
-    if (chunk.type === "tool-call") {
-      input.onEvent({
-        type: "progress",
-        message: `Running ${chunk.payload.toolName}`,
-      });
+    console.dir(chunk, { depth: 5 });
 
-      continue;
-    }
-
-    if (chunk.type === "text-delta") {
-      const text = chunk.payload.text;
-
-      if (text) {
-        input.onEvent({
-          type: "token",
-          token: text,
+    switch (chunk.type) {
+      case "tool-call":
+        await input.onEvent({
+          type: "progress",
+          message: `Running ${chunk.payload.toolName}`,
         });
-      }
+        break;
+
+      case "tool-result":
+        console.log("Tool result:", chunk.payload);
+        break;
+
+      case "tool-error":
+        console.error("Tool execution error:", chunk.payload);
+        break;
+
+      case "text-delta":
+        if (chunk.payload.text) {
+          await input.onEvent({
+            type: "token",
+            token: chunk.payload.text,
+          });
+        }
+        break;
+
+      case "error":
+        console.error("Mastra stream error:", chunk.payload.error);
+        streamError = chunk.payload.error;
+        break;
+
+      case "finish":
+        console.log("Finish reason:", chunk.payload.stepResult.reason);
+        console.log("Raw finish reason:", chunk.payload.stepResult.rawReason);
+        break;
+
+      default:
+        console.log("Other stream event:", chunk.type);
     }
   }
 
-  // streaming finishes
+  // console.log("Stream error:", result.error);
+  // if (result.error) {
+  //   throw result.error;
+  // }
 
+  console.log("[agent] stream consumption finished");
+
+  const output = await result.getFullOutput();
+
+  console.log("Final output:", {
+    text: output.text,
+    finishReason: output.finishReason,
+    usage: output.usage,
+    toolCalls: output.toolCalls,
+    toolResults: output.toolResults,
+  });
+
+  const failure = streamError ?? result.error ?? output.error;
+
+  if (failure) {
+    throw failure instanceof Error
+      ? failure
+      : new Error(
+          typeof failure === "string"
+            ? failure
+            : "Agent execution failed",
+        );
+  }
+
+  // streaming finishes  
   const thread = await memory.getThreadById({
     threadId: input.threadId,
     resourceId: input.authUserId,
@@ -187,7 +254,7 @@ export async function streamAgentReply(input: StreamAgentReplyInput) {
     });
   }
 
-  input.onEvent({
+  await input.onEvent({
     type: "completed",
     message: "done",
   });

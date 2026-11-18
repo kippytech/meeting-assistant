@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type Response  } from "express";
 import { z } from "zod";
 import { requireSession } from "../middleware/requireSession.js";
 import {
@@ -6,6 +6,7 @@ import {
   listUserThreads,
   streamAgentReply,
 } from "../services/agent.service.js";
+import type { AgentEvent } from "../services/agent.service.js";
 
 export const agentRoutes = Router();
 
@@ -46,6 +47,60 @@ agentRoutes.get("/threads/:threadId", async (req, res) => {
   }
 });
 
+
+class ClientDisconnectedError extends Error {
+  constructor() {
+    super("SSE client disconnected");
+    this.name = "ClientDisconnectedError";
+  }
+}
+
+async function writeSse(res: Response, event: AgentEvent): Promise<void> {
+  if (res.destroyed || res.writableEnded) {
+    throw new ClientDisconnectedError();
+  }
+
+  const accepted = res.write(
+    `data: ${JSON.stringify(event)}\n\n`,
+  );
+
+  if (accepted) return;
+
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      res.off("drain", onDrain);
+      res.off("close", onClose);
+      res.off("error", onError);
+    };
+
+    const onDrain = () => {
+      cleanup();
+      resolve();
+    };
+
+    const onClose = () => {
+      cleanup();
+      reject(new ClientDisconnectedError());
+    };
+
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+
+    res.once("drain", onDrain);
+    res.once("close", onClose);
+    res.once("error", onError);
+
+    // The buffer may have drained between write() and listener setup.
+    if (res.destroyed || res.writableEnded) {
+      onClose();
+    } else if (!res.writableNeedDrain) {
+      onDrain();
+    }
+  });
+}
+
 agentRoutes.post("/chat", async (req, res) => {
   const parsed = chatSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -53,15 +108,23 @@ agentRoutes.post("/chat", async (req, res) => {
     return;
   }
 
+  const controller = new AbortController();
+
   res.status(200);
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
+  //res.setHeader("Connection", "keep-alive");
   res.flushHeaders();
 
-  const write = (event: Record<string, unknown>) => {
-    res.write(`data: ${JSON.stringify(event)}\n\n`);
-  };
+  res.once("close", () => {
+    if (!res.writableEnded) {
+      controller.abort(new Error("Client disconnected"));
+    }
+  });
+
+  // const write = async (event: Record<string, unknown>) => {
+  //   res.write(`data: ${JSON.stringify(event)}\n\n`);
+  // };
 
   try {
     await streamAgentReply({
@@ -69,13 +132,40 @@ agentRoutes.post("/chat", async (req, res) => {
       authUserId: req.authContext!.authUserId,
       threadId: parsed.data.threadId,
       message: parsed.data.message,
-      onEvent: write,
+      //onEvent: write,
+      signal: controller.signal,
+      onEvent: (event) => writeSse(res, event),
     });
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "failed to list threads";
-    write({ type: "error", message });
-  } finally {
-    res.end();
+    if (
+      controller.signal.aborted ||
+      res.destroyed ||
+      error instanceof ClientDisconnectedError
+    ) {
+      console.info("[agent] Client disconnected; stream cancelled");
+      return;
+    }
+
+    console.error("[agent route] execution failed:", error);
+
+    if (!res.destroyed && !res.writableEnded) {
+      const message =
+        error instanceof Error ? error.message : "Unknown agent error";
+
+      await writeSse(res, {
+        type: "error",
+        message:
+          process.env.NODE_ENV === "production"
+            ? "Agent execution failed"
+            : message,
+      }).catch(() => {});
+    }
+  }
+
+    // Log the detailed error server-side, with a request/correlation ID.
+  finally {
+    if (!res.destroyed && !res.writableEnded) {
+      res.end();
+    }
   }
 });

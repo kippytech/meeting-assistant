@@ -5,6 +5,7 @@ import {
   LoaderCircle,
   MessageSquarePlus,
   Sparkles,
+  Square,
 } from "lucide-react";
 import {
   FormEvent,
@@ -153,6 +154,7 @@ function ChatPanel({ sessionToken, connections, footer }: Props) {
     messages.length === 1 && messages[0]?.id === "welcome" && !running;
 
   const bottomRef = useRef<HTMLDivElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const refreshThreads = useCallback(async () => {
     try {
@@ -202,10 +204,18 @@ function ChatPanel({ sessionToken, connections, footer }: Props) {
     }
   }
 
+  function cancelGeneration() {
+    abortControllerRef.current?.abort();
+  }
+
   async function sendMessage(text: string) {
     const trimmed = text.trim();
 
     if (!trimmed || running || loadingThread) return;
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     const assistantId = crypto.randomUUID();
 
     setMessages((current) => [
@@ -265,10 +275,18 @@ function ChatPanel({ sessionToken, connections, footer }: Props) {
             );
           }
         },
+        controller.signal,
       );
 
       refreshThreads();
-    } catch {
+    } catch (error) {
+      if (controller.signal.aborted) {
+        // Intentional cancellation. Preserve any partial response.
+        return;
+      }
+
+      console.error("Agent request failed:", error);
+
       setMessages((current) => [
         ...current,
         {
@@ -476,14 +494,15 @@ function ChatPanel({ sessionToken, connections, footer }: Props) {
                 className={styles.composerInput}
               />
               <Button
-                type="submit"
+                type={running ? "button" : "submit"}
                 size="icon"
-                disabled={!prompt.trim() || running}
+                disabled={!running && !prompt.trim()}
+                onClick={running ? cancelGeneration : undefined}
                 className={styles.sendBtn}
-                aria-label="Send Text Message"
+                aria-label={running ? "Stop generating" : "Send message"}
               >
                 {running ? (
-                  <LoaderCircle className={styles.sendIconSpin} />
+                  <Square className={styles.sendIcon} />
                 ) : (
                   <ArrowUp className={styles.sendIcon} />
                 )}
